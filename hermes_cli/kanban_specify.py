@@ -8,6 +8,15 @@ Mirrors ``hermes_cli/goals.py``: same aux-client pattern, same "empty config
 => skip, don't crash" tolerance. One shot, no retry loop. JSON mode is not
 requested (works on providers without it); the parse is lenient and falls
 back to "whole reply is the body" so a malformed reply never strands a task.
+
+Two guard-aware behaviours (see ``_ensure_change_plan``): the system prompt
+demands the regenerated body end with a literal ``## CHANGE PLAN`` section,
+and the written body is then guaranteed to carry that heading — a
+coordinator-authored section is re-appended verbatim after regeneration, and
+when neither the regenerated nor the old body has one, a deterministic
+scaffold is built from the specifier's own ``**Approach**`` bullets. The
+board's ``trg_planless_promotion_guard`` greps the stored body for that
+heading and rolls the card back to triage without it.
 """
 
 from __future__ import annotations
@@ -50,12 +59,34 @@ heading, in this order:
   **Out of scope** — short list of things NOT to touch (omit if nothing
       obvious; never invent scope creep).
 
+The body MUST end with a change-plan section that begins with this literal
+markdown heading on its own line — byte-exact (two hashes, single spaces,
+nothing else on the line):
+
+  ## CHANGE PLAN
+
+followed by four bold sub-parts in this order:
+
+  **Build** — what gets changed: files, modules, commands, config keys.
+  **Verify** — concrete commands/checks that prove the change works.
+  **Rollback** — how to restore the pre-change state exactly.
+  **Window** — when the change may land (e.g. "any time", "off-hours").
+
+This heading is not decoration: the board's promotion guard greps the stored
+body for the exact string `## CHANGE PLAN` and refuses to promote a card that
+lacks it, bouncing it back to triage.
+
 Rules:
   - Keep the tightened title close in meaning to the original idea — do
     NOT invent a different project.
   - If the original idea is already detailed, preserve its substance and
     just reformat into the sections above.
   - Never add invented requirements the user didn't hint at.
+  - The `## CHANGE PLAN` heading must appear literally in the body exactly
+    once, and the body must end with that section.
+  - If the original body already carries a `## CHANGE PLAN` section, keep
+    its Build/Verify/Rollback/Window content intact (reformatting allowed,
+    dropping or re-scoping it is not).
   - No preamble, no closing remarks, no code fences around the JSON.
   - Output only the JSON object and nothing else.
 """
@@ -114,6 +145,103 @@ def _title_body(parsed: dict) -> tuple[Optional[str], Optional[str]]:
     either None when missing/blank."""
     title = _nonblank(parsed.get("title"))
     return (title.strip() if title else None), _nonblank(parsed.get("body"))
+
+
+# The board's promotion guard (trg_planless_promotion_guard on the live DB)
+# refuses todo|triage -> ready unless body LIKE '%## CHANGE PLAN%'. The body
+# is regenerated wholesale below, so without _ensure_change_plan the
+# heading a coordinator added via `hermes kanban edit` is erased by the very
+# command that needs it and the card bounces triage -> ready -> triage.
+_CHANGE_PLAN_HEADING_RE = re.compile(r"^[ \t]*##[ \t]+CHANGE PLAN\b", re.MULTILINE)
+
+
+def _extract_change_plan(body: Optional[str]) -> Optional[str]:
+    """The ``## CHANGE PLAN`` section of *body* — literal heading line to the
+    end of the body, stripped — or None when there is no such heading."""
+    if not body:
+        return None
+    m = _CHANGE_PLAN_HEADING_RE.search(body)
+    if not m:
+        return None
+    section = body[m.start():].strip()
+    return section or None
+
+
+# The specifier's own section set (see _SYSTEM_PROMPT). The scaffold below is
+# built from the specifier's own **Approach** bullets so the card keeps the
+# substance the specifier wrote instead of a generic stub.
+_APPROACH_SECTION_RE = re.compile(
+    r"^\*\*Approach\*\*\s*$", re.IGNORECASE | re.MULTILINE
+)
+
+_SCAFFOLD_PLACEHOLDER = "worker must fill in before promote"
+
+
+def _approach_bullets(body: str) -> list[str]:
+    """The specifier's ``**Approach**`` bullets, in order.
+
+    Used as the ``**Build**`` steps of the generated scaffold so the card
+    keeps the substance the specifier wrote instead of a generic stub.
+    """
+    m = _APPROACH_SECTION_RE.search(body or "")
+    if not m:
+        return []
+    # The Approach section runs until the next bold heading.
+    tail = body[m.end():]
+    nxt = re.search(r"^\*\*[A-Za-z][^*]*\*\*\s*$", tail, re.MULTILINE)
+    section = tail[: nxt.start()] if nxt else tail
+    bullets = []
+    for line in section.splitlines():
+        s = line.strip()
+        if s.startswith(("- ", "* ")):
+            bullets.append(s[2:].strip())
+        elif s and not s.startswith("#"):
+            # A non-bullet paragraph under Approach is still a step.
+            bullets.append(s)
+    return [b for b in bullets if b]
+
+
+def _build_change_plan_scaffold(body: str) -> str:
+    """A deterministic ``## CHANGE PLAN`` section built from *body*.
+
+    Used when neither the regenerated body nor the old body carries a plan:
+    the aux model can ignore the prompt, and without a scaffold the card
+    bounces ``triage -> todo -> ready -> triage`` forever. The scaffold is
+    deliberately explicit that a worker still has to fill it in — it makes the
+    card *promotable*, not complete.
+    """
+    steps = _approach_bullets(body)
+    if steps:
+        build_lines = "\n".join(f"- {s}" for s in steps)
+    else:
+        build_lines = f"- {_SCAFFOLD_PLACEHOLDER}"
+    return (
+        "## CHANGE PLAN\n\n"
+        f"**Build**\n{build_lines}\n\n"
+        f"**Verify** — {_SCAFFOLD_PLACEHOLDER}\n\n"
+        f"**Rollback** — {_SCAFFOLD_PLACEHOLDER}\n\n"
+        f"**Window** — {_SCAFFOLD_PLACEHOLDER}\n"
+    )
+
+
+def _ensure_change_plan(old_body: Optional[str], new_body: str) -> str:
+    """Return *new_body* guaranteed to carry a literal ``## CHANGE PLAN``.
+
+    Resolution order:
+      1. *new_body* already has one — leave it alone.
+      2. *old_body* has one — re-append it verbatim (coordinator's plan).
+      3. Neither — append a deterministic scaffold built from the
+         specifier's own **Approach** bullets.
+    """
+    if _CHANGE_PLAN_HEADING_RE.search(new_body):
+        return new_body
+    section = _extract_change_plan(old_body)
+    if section is None:
+        section = _build_change_plan_scaffold(new_body)
+    base = new_body.strip()
+    if not base:
+        return section + "\n"
+    return base + "\n\n" + section + "\n"
 
 
 def _profile_author(default: str = "specifier") -> str:
@@ -219,6 +347,13 @@ def specify_task(
         new_title, new_body = _title_body(parsed)
         if new_body is None and new_title is None:
             return SpecifyOutcome(task_id, False, "LLM response missing title and body")
+
+    # Preserve a coordinator-authored ## CHANGE PLAN across regeneration (the
+    # promotion guard reads the body we are about to write), and guarantee the
+    # guard's invariant even when the aux model ignored the prompt. body=None
+    # means "keep the old body", which already carries the plan — nothing to do.
+    if new_body is not None:
+        new_body = _ensure_change_plan(task.body, new_body)
 
     with kbc.connect_closing() as conn:
         ok = kb.specify_triage_task(
