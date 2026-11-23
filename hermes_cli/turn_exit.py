@@ -12,6 +12,14 @@ TERMINAL_PROVIDER_REASONS = frozenset({
     "auth", "auth_permanent", "model_not_found", "ssl_cert_verification", "upstream_blocked",
 })
 
+# The exit code for an interrupted turn. POSIX shells report a SIGINT death as
+# 128+SIGINT (130), and the one-shot CLI uses the same number for a Ctrl-C'd
+# turn, so a worker that ends its turn early exits 130 whatever produced the
+# interruption. Named here because the Kanban dispatcher books the same number:
+# a managed run whose OWNER ended the turn (a gateway shutdown/restart) is an
+# interrupted attempt, not a crash of the card's work.
+INTERRUPTED_EXIT_CODE = 130
+
 
 def turn_exit_code(
     result, *, kanban_worker: bool, credentials_rate_limited: bool = False,
@@ -28,7 +36,7 @@ def turn_exit_code(
             return KANBAN_TERMINAL_PROVIDER_EXIT_CODE
         return 1
     if result.get("interrupted"):
-        return 130
+        return INTERRUPTED_EXIT_CODE
     if not (result.get("failed") or result.get("partial") or result.get("completed") is False):
         return 0
     if kanban_worker:

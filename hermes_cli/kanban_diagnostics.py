@@ -364,7 +364,8 @@ def _failure_threshold(cfg: dict) -> Any:
     return cfg.get("failure_threshold", cfg.get("spawn_failure_threshold", 3))
 
 
-_OUTCOME_LABELS = {"spawn_failed": "spawn", "timed_out": "timeout", "crashed": "crash"}
+_OUTCOME_LABELS = {"spawn_failed": "spawn", "timed_out": "timeout", "crashed": "crash",
+                   "owner_interrupted": "owner-interrupted"}
 
 
 def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:

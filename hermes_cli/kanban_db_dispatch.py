@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 from hermes_cli._startup_fast import project_root_str
 from hermes_cli.kanban_worker_log import open_task_worker_log as _open_worker_log
+from hermes_cli.turn_exit import INTERRUPTED_EXIT_CODE
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -77,6 +78,16 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # wall, burning a worker slot every tick for hours. Overridable via
 # ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS``.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
+
+# How many consecutive owner-ended turns (a gateway shutdown/reload stopped the
+# managed turn) a card may have for free. Those turns are requeued WITHOUT
+# counting a failure, so without a bound a flapping gateway would requeue the
+# same card forever and the breaker would never see it. After this many, the
+# next owner-ended turn is booked as an ordinary crash.
+_OWNER_INTERRUPTED_FAILURE_LIMIT = 3
+
+# Closed runs to walk when counting the owner-interrupted streak.
+_OWNER_INTERRUPTED_SCAN_LIMIT = 50
 
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
@@ -144,6 +155,10 @@ class DispatchResult:
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
     a failure — a long quota window must never trip the circuit breaker."""
+    owner_interrupted: list[str] = field(default_factory=list)
+    """Task ids whose run the OWNER ended (a gateway shutdown/reload stopped the
+    managed turn) and were released to ``ready`` WITHOUT counting a failure — the
+    host killed the attempt, not the card's work."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -1051,12 +1066,98 @@ class _DeadWorker:
     terminal_provider: bool = False
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
+    owner_interrupted: bool = False
+    """The OWNER ended this turn (its admission settled ``interrupted``): a gateway
+    shutdown or reload stopped the managed turn. The card's work did not fail, so
+    the run is requeued WITHOUT counting a failure."""
 
     @property
     def run_outcome(self) -> str:
         # A rate-limited requeue is recorded as ``rate_limited`` so board history
-        # doesn't show a phantom crash for a quota wall.
+        # doesn't show a phantom crash for a quota wall. An owner-ended turn is
+        # recorded as ``owner_interrupted`` for the same reason: the host ended the
+        # attempt, the card did not fail.
+        if self.owner_interrupted:
+            return "owner_interrupted"
         return "rate_limited" if self.rate_limited else "crashed"
+
+
+def _book_owner_interrupted(conn, task_id, pid, dead) -> bool:
+    """Re-book a dead worker the OWNER ended as an interrupted requeue, not a crash.
+
+    The owner settles its admission ``interrupted`` when IT ends the turn: a
+    gateway shutdown or reload stops the managed turn, the worker exits with the
+    interrupt convention, and the attempt dies with the host. The card's work did
+    not fail, so the run is released to its source phase WITHOUT counting a
+    failure — the same treatment a quota wall gets.
+
+    Bounded: a card whose owner keeps bouncing it (a flapping gateway) would
+    otherwise be requeued forever without the breaker ever seeing it. After the
+    card's own retry budget of free requeues, the next owner-ended turn is booked
+    as an ordinary crash so the breaker can stop it and an operator can look.
+    """
+    if dead.kind != "nonzero_exit" or dead.code != INTERRUPTED_EXIT_CODE:
+        return False
+    if not dead.event_payload.get("owner_ended_turn"):
+        return False  # the worker died under a live owner, not because the owner ended it
+    from hermes_cli.kanban_owner_recovery import _latest_run_event
+    if _latest_run_event(conn, task_id, "worker_lost"):
+        return False  # the owner LOST the worker: the turn never finished
+    if _owner_interrupted_streak(conn, task_id) >= _owner_interrupted_limit(conn, task_id):
+        return False  # too many owner-ended turns in a row: book it as a crash
+    head, sep, output = dead.error_text.partition(WORKER_OUTPUT_SEP)
+    note = str(dead.event_payload.get("attempt_note") or "")
+    detail = f" [{note}]" if note else ""
+    dead.error_text = (
+        f"pid {pid} exited with code {dead.code} after the owner ended the turn "
+        f"(gateway shutdown or reload){detail} — requeued without counting a failure{sep}{output}"
+    )
+    dead.event_kind = "owner_interrupted"
+    # ``exit_kind`` keeps the raw classification (the process really did exit
+    # non-zero); the booking decision rides on the event kind, the run outcome
+    # and this marker.
+    dead.event_payload["owner_interrupted"] = True
+    dead.owner_interrupted = True
+    return True
+
+
+def _owner_interrupted_streak(conn, task_id) -> int:
+    """Count the task's trailing run of owner-ended turns.
+
+    Walks closed runs newest-first. ``rate_limited`` runs are neutral and
+    skipped (a quota wall says nothing about the task); any other closed run
+    breaks the streak, so the free-requeue budget counts ONLY owner-ended turns.
+    """
+    streak = 0
+    rows = conn.execute(
+        "SELECT outcome FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY id DESC LIMIT ?",
+        (task_id, _OWNER_INTERRUPTED_SCAN_LIMIT),
+    ).fetchall()
+    for row in rows:
+        outcome = row["outcome"] or ""
+        if outcome == "rate_limited":
+            continue
+        if outcome == "owner_interrupted":
+            streak += 1
+            continue
+        break
+    return streak
+
+
+def _owner_interrupted_limit(conn, task_id) -> int:
+    """How many consecutive owner-ended turns this card may have for free.
+
+    The card's own ``max_retries`` wins (it is the card's attempt budget); the
+    dispatcher default applies otherwise.
+    """
+    row = conn.execute("SELECT max_retries FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is not None:
+        override = _kb._row_get(row, "max_retries")
+        if override is not None:
+            return int(override)
+    return _OWNER_INTERRUPTED_FAILURE_LIMIT
 
 
 def _classify_dead_worker(
@@ -1155,6 +1256,10 @@ class _CrashSweep:
 
     crashed: list[str] = field(default_factory=list)
     rate_limited: list[str] = field(default_factory=list)
+    owner_interrupted: list[str] = field(default_factory=list)
+    """Task ids whose run the OWNER ended (a gateway shutdown/reload stopped the
+    managed turn): requeued to ``ready`` WITHOUT counting a failure — the host
+    killed the attempt, not the card's work."""
     # ``(task_id, pid, claimer, dead_worker)``: accounted after the txn via
     # ``_record_task_failure`` (needs its own write_txn).
     crash_details: list[tuple[str, int, str, _DeadWorker]] = field(default_factory=list)
@@ -1173,7 +1278,11 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = _kb._host_prefix()
-        from hermes_cli.kanban_owner_recovery import apply_attempt_note, managed_run_exit_code, owner_reclaim_blocked
+        from hermes_cli.kanban_owner_recovery import (
+            apply_attempt_note,
+            managed_run_exit_code,
+            owner_reclaim_blocked,
+        )
         for row in rows:
             lock = row["claim_lock"] or ""
             if not lock.startswith(host_prefix):
@@ -1195,6 +1304,47 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             exit_code = managed_run_exit_code(conn, row["id"], pid, row["claim_lock"])
             dead = _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board)
             apply_attempt_note(conn, row["id"], pid, dead)
+            # The OWNER ended this turn (a gateway shutdown/reload stopped the managed
+            # turn): the host killed the attempt, not the card's work. Requeue it
+            # WITHOUT counting a failure — the card's scope survives, only this run died.
+            if _book_owner_interrupted(conn, row["id"], pid, dead):
+                retry_status = _kb._retry_status_for_run(conn, row["id"])
+                dead.event_payload["retry_status"] = retry_status
+                cur = conn.execute(
+                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
+                    "WHERE id = ? AND status = 'running' "
+                    "  AND worker_pid = ? AND claim_lock IS ?",
+                    (retry_status, row["id"], pid, row["claim_lock"]),
+                )
+                if cur.rowcount != 1:
+                    continue
+                run_id = _kb._end_run(
+                    conn, row["id"],
+                    outcome=dead.run_outcome, status=dead.run_outcome,
+                    error=dead.error_text,
+                    metadata=dict(dead.event_payload),
+                )
+                _kb._append_event(conn, row["id"], dead.event_kind, dead.event_payload, run_id=run_id)
+                sweep.exited_hook_payloads.append({
+                    "task_id": row["id"],
+                    "assignee": row["assignee"],
+                    "run_id": run_id,
+                    "worker_pid": pid,
+                    "exit_kind": dead.kind,
+                    "exit_code": dead.code,
+                    "outcome": dead.run_outcome,
+                    "retry_status": retry_status,
+                })
+                # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
+                # the board and the retry worker need to see WHY the run ended, but an
+                # owner-ended turn is not a failure of the card.
+                conn.execute(
+                    "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                    (dead.error_text[:500], row["id"]),
+                )
+                sweep.owner_interrupted.append(row["id"])
+                continue
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
@@ -1339,6 +1489,7 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     # requeues did NOT count a failure and are NOT crashes.
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
     detect_crashed_workers._last_rate_limited = sweep.rate_limited  # type: ignore[attr-defined]
+    detect_crashed_workers._last_owner_interrupted = sweep.owner_interrupted  # type: ignore[attr-defined]
     # Fired only now, after the reclaim txn AND breaker accounting have
     # committed, so subscribers always observe fully durable board state.
     if sweep.exited_hook_payloads and _kb._kanban_observer_consumed("on_kanban_worker_exited"):
@@ -1618,10 +1769,14 @@ def check_respawn_guard(
     # 2. Quota / auth blocker: retrying immediately will not help.  A plain
     # crash is different: its persisted error includes the worker's last
     # captured output, which is context rather than a diagnosis and may contain
-    # benign commands such as ``claude auth status`` (#117097).
+    # benign commands such as ``claude auth status`` (#117097).  An
+    # owner-interrupted requeue is the same case: the stamped text names the
+    # owner's shutdown, not a quota or credential wall, so it must not park the
+    # card either.
     err = _kb._lossy_text(row["last_failure_error"])
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
-    if err and latest_outcome != "crashed" and not infrastructure and _RESPAWN_BLOCKER_RE.search(err):
+    if (err and latest_outcome not in ("crashed", "owner_interrupted") and not infrastructure
+            and _RESPAWN_BLOCKER_RE.search(err)):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
@@ -2199,6 +2354,7 @@ def _run_reclaim_phase(
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
+    result.owner_interrupted.extend(getattr(detect_crashed_workers, "_last_owner_interrupted", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
