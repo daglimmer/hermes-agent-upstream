@@ -38,6 +38,10 @@ from agent.conversation_compression import (
     COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE, IDLE_COMPACTION_STATUS_TEMPLATE,
     PRE_API_COMPRESSION_STATUS_TEMPLATE, PREFLIGHT_COMPRESSION_STATUS_TEMPLATE)
 from gateway.run_status_filter import EMPTY_LADDER_STATUS_PATTERN, _status_template_to_regex, hidden_outside_dm, is_terminal_failure_status
+from gateway.interrupt_reasons import (
+    INTERRUPT_REASON_GATEWAY_RESTART,
+    INTERRUPT_REASON_GATEWAY_SHUTDOWN,
+)
 from agent.conversation_compression_archive import MERGED_DURABLE_ROWS, RETIRED_DURABLE_ROWS, UNNAMED_DURABLE_ROWS
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.interrupt_compat import request_hard_interrupt
@@ -2573,8 +2577,8 @@ _INTERRUPT_REASON_EVICTED = "Session ended while the turn was running"
 _INTERRUPT_TOOL_REASON_EVICTED = "session evicted"
 _INTERRUPT_TOOL_REASON_GATEWAY_SHUTDOWN = "gateway shutdown"
 _INTERRUPT_REASON_SSE_DISCONNECT = "SSE client disconnected"
-_INTERRUPT_REASON_GATEWAY_SHUTDOWN = "Gateway shutting down"
-_INTERRUPT_REASON_GATEWAY_RESTART = "Gateway restarting"
+_INTERRUPT_REASON_GATEWAY_SHUTDOWN = INTERRUPT_REASON_GATEWAY_SHUTDOWN
+_INTERRUPT_REASON_GATEWAY_RESTART = INTERRUPT_REASON_GATEWAY_RESTART
 
 
 def _reap_gateway_turn_processes(

@@ -45,6 +45,58 @@ def _admission_row(receipt):
     return (rows[0].status, rows[0].outcome) if rows else None
 
 
+def _owner_admission_facts(receipt):
+    """``(status, outcome, cause)`` from the owner ledger ``receipt`` names, or None.
+
+    ``status``/``outcome`` are the admission row's; ``cause`` is the owner's recorded reason
+    for ending the turn, read from the stored result next to that row. The result carries
+    ``interrupt_message``: the reason the owner stopped the turn. A gateway shutdown or
+    reload stops it with the owner's own reason; a user's Stop carries a different one.
+    Reading the cause from the ledger is what tells those two apart — the exit code alone
+    cannot.
+
+    One ledger read serves all three facts. None means "the owner said nothing we can read"
+    — never "the owner said the attempt ended", and never a guessed cause.
+    """
+    if not receipt:
+        return None
+    from persistence.core.errors import STORE_FAILURES
+    from persistence_assembly import open_persistence_reader
+
+    try:
+        session_id, request_id = receipt['session_id'], receipt['request_id']
+        if session_id is None or request_id is None:
+            return None  # a NULL identity names no row, while match() drops a None filter
+        with open_persistence_reader(Path(receipt['db'])) as owner:
+            rows = owner.admissions.match(session_id=session_id, request_id=request_id)
+            if not rows:
+                return None
+            status, outcome = rows[0].status, rows[0].outcome
+            cause = None
+            if status == "terminal":
+                settled = owner.admissions.settled_result(admission_id=rows[0].admission_id)
+                if settled is not None:
+                    saved = getattr(settled, "result", None)
+                    if isinstance(saved, dict):
+                        turn = saved.get("result") if isinstance(saved.get("result"), dict) else saved
+                        if turn.get("interrupt_message"):
+                            cause = str(turn["interrupt_message"])
+    except (OSError, KeyError, TypeError, ValueError, *STORE_FAILURES):
+        return None
+    return (status, outcome, cause)
+
+
+def owner_shutdown_cause(cause) -> bool:
+    """True when the owner's reason names the gateway's OWN shutdown or restart.
+
+    The owner's own reasons (``gateway/interrupt_reasons.py``): a shutdown drains the
+    active turns and a reload restarts the gateway. A user's Stop, a session reset and an
+    inactivity timeout are different reasons and are NOT an owner shutdown.
+    """
+    from gateway.interrupt_reasons import is_owner_shutdown
+    return is_owner_shutdown(cause)
+
+
 def owner_reclaim_paused(conn, task_id):
     """Missing/ambiguous owner receipts never authorize another attempt."""
     receipt = _owner_receipt(conn, task_id)
@@ -187,6 +239,29 @@ def owner_attempt_provably_over(conn, task_id) -> bool:
     return settled or (bool(pids) and _owner_process_gone(receipt))
 
 
+def owner_interrupted_attempt(conn, task_id) -> bool:
+    """True when the OWNER ended this turn: its admission settled ``interrupted``.
+
+    The owner settles an admission ``interrupted`` when IT ends the turn: a
+    gateway shutdown or reload stops the managed turn and the owner records
+    that. The ledger is the owner's own record of the attempt, so the board
+    reads the cause from there instead of guessing it from the exit code.
+
+    False when there is no owner receipt (a plain dispatcher worker), when the
+    ledger cannot be read, or when the admission says anything else.
+    """
+    row = _owner_admission(conn, task_id)
+    return bool(row) and row[0] == "terminal" and row[1] == "interrupted"
+
+
+def _owner_admission(conn, task_id):
+    """``(status, outcome)`` from the run's owner ledger, or None when unreadable."""
+    receipt = _owner_receipt(conn, task_id)
+    if receipt is None:
+        return None
+    return _admission_row(receipt)
+
+
 def owner_attempt_note(conn, task_id, lost=None) -> str:
     """One clause naming why the owner says the attempt ended, or ``""``.
 
@@ -195,18 +270,41 @@ def owner_attempt_note(conn, task_id, lost=None) -> str:
     passed as ``lost`` when the caller already read it) is a different fault from a worker
     that never started.
     """
+    note, _interrupted = owner_attempt_facts(conn, task_id, lost)
+    return note
+
+
+def owner_attempt_facts(conn, task_id, lost=None):
+    """``(note, owner_ended_turn)``: why the owner says the attempt ended, and whether the
+    OWNER ended it with ITS OWN shutdown.
+
+    The owner settles an admission ``interrupted`` when IT ends the turn, and records WHY
+    in the same ledger: the gateway's own shutdown/restart reason, or a user's Stop. Only
+    the owner's own shutdown or restart is an owner-caused interruption the board must not
+    charge against the card; a user's Stop is a decision about the run, not a host bounce.
+
+    One ledger read serves both facts: the note names the outcome, the flag says the
+    owner ended the turn with its own shutdown.
+    """
     if lost is None:
-        lost = _latest_run_event(conn, task_id, 'worker_lost')
-    reason = str(lost.get('reason') or '')
+        lost = _latest_run_event(conn, task_id, "worker_lost")
+    reason = str(lost.get("reason") or "")
     if reason:
-        return f"managed worker lost: {reason[:80]}"
+        return f"managed worker lost: {reason[:80]}", False
     receipt = _owner_receipt(conn, task_id)
     if receipt is None:
-        return ""
-    admission = _admission_row(receipt)
-    if admission is not None and admission[0] == 'terminal':
-        return f"owner admission settled {admission[1] or 'terminal'}"
-    return ""
+        return "", False
+    facts = _owner_admission_facts(receipt)
+    if facts is None:
+        return "", False
+    status, outcome, cause = facts
+    if status != "terminal":
+        return "", False
+    outcome = outcome or "terminal"
+    note = f"owner admission settled {outcome}"
+    if cause:
+        note += f": {cause}"
+    return note, owner_shutdown_cause(cause)
 
 
 def reclaim_error(conn, task_id, claim_lock) -> str:
@@ -224,10 +322,11 @@ def apply_attempt_note(conn, task_id, pid, dead) -> None:
     protocol-violation streak (which reads the persisted payload) does not count it.
     """
     lost = _latest_run_event(conn, task_id, "worker_lost")
-    note = owner_attempt_note(conn, task_id, lost)
+    note, owner_ended = owner_attempt_facts(conn, task_id, lost)
     if not note:
         return
     dead.event_payload["attempt_note"] = note
+    dead.event_payload["owner_ended_turn"] = owner_ended
     if lost:
         dead.event_payload["worker_lost"] = lost
         if dead.protocol_violation:
