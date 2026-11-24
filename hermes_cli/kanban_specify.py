@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_park as park
 from hermes_cli import kanban_db_connect as kbc
 
 from utils import env_int
@@ -235,7 +236,14 @@ def specify_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Task ids in the triage column; ``tenant`` narrows the sweep."""
+    """Task ids in the triage column; ``tenant`` narrows the sweep.
+
+    Cards parked on a human are left out: an automatic sweep must not
+    promote a card that waits for a person (#118620). An explicit
+    ``hermes kanban specify <id>`` still works — that is an operator acting
+    on a named card.
+    """
     with kbc.connect_closing() as conn:
         tasks = kb.list_tasks(conn, status="triage", tenant=tenant, include_archived=False)
-    return [t.id for t in tasks]
+        parked = park.parked_on_human_task_ids(conn, [t.id for t in tasks])
+    return [t.id for t in tasks if t.id not in parked]
