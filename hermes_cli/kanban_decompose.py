@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_park as park
 from hermes_cli.kanban_db_graph import decompose_triage_task
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import profiles as profiles_mod
@@ -337,7 +338,15 @@ def decompose_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+    """Return task ids currently in the triage column.
+
+    Cards parked on a human are left out: a card whose newest park event
+    says ``needs_input`` waits for a person, and an automatic sweep that
+    promotes it overrides that hold and hands it back to the dispatcher
+    (#118620). An explicit ``hermes kanban decompose <id>`` still works —
+    that is an operator acting on a named card.
+    """
     with kbc.connect_closing() as conn:
         rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
-    return [row.id for row in rows]
+        parked = park.parked_on_human_task_ids(conn, [row.id for row in rows])
+    return [row.id for row in rows if row.id not in parked]

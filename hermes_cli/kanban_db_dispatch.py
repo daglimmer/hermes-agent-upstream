@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 from hermes_cli._startup_fast import project_root_str
+from hermes_cli.kanban_db_respawn import classify_respawn_blocker
 from hermes_cli.kanban_worker_log import open_task_worker_log as _open_worker_log
 
 if TYPE_CHECKING:
@@ -52,22 +53,6 @@ TERMINAL_WORKER_REAP_GRACE_SECONDS = 120
 # ---------------------------------------------------------------------------
 # Respawn guard constants
 # ---------------------------------------------------------------------------
-
-# Patterns in last_failure_error that indicate a quota / auth blocker.
-# These errors won't resolve by retrying immediately — auto-block instead.
-# The auth family is a curated list, not an open `auth\w*` stem: that stem
-# also matched ordinary English words like "author"/"authored"/"authoring"/
-# "authoritative" in worker progress prose, parking a healthy card forever
-# (#117009).
-_RESPAWN_BLOCKER_RE = re.compile(
-    r"\b(quota|rate[\s_\-]?limit|429|403|"
-    r"auth|authenticat(?:e|es|ed|ing|ion)|authoriz(?:e|es|ed|ing|ation)|"
-    r"authoris(?:e|es|ed|ing|ation)|authz|"
-    r"unauthorized|forbidden|billing|subscription|"
-    r"access[\s_]denied|permission[\s_]denied|"
-    r"invalid[\s_]api[\s_]key)\b",
-    re.IGNORECASE,
-)
 
 # Within this window a completed run counts as "recent proof"; don't re-spawn.
 _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
@@ -1619,9 +1604,15 @@ def check_respawn_guard(
     # crash is different: its persisted error includes the worker's last
     # captured output, which is context rather than a diagnosis and may contain
     # benign commands such as ``claude auth status`` (#117097).
+    #
+    # The classifier — not the raw pattern — decides: the dispatcher's OWN
+    # rate-limit requeue note names a quota wall while reporting a run it
+    # released on purpose, so matching the pattern alone parked the card for
+    # good once a later run superseded the rate-limited one (#118620).
     err = _kb._lossy_text(row["last_failure_error"])
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
-    if err and latest_outcome != "crashed" and not infrastructure and _RESPAWN_BLOCKER_RE.search(err):
+    if (err and latest_outcome != "crashed" and not infrastructure
+            and classify_respawn_blocker(err) == "blocker_auth"):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
