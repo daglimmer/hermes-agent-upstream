@@ -1173,7 +1173,12 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = _kb._host_prefix()
-        from hermes_cli.kanban_owner_recovery import apply_attempt_note, managed_run_exit_code, owner_reclaim_blocked
+        from hermes_cli.kanban_owner_recovery import (
+            apply_attempt_note,
+            managed_run_exit_code,
+            owner_reclaim_blocked,
+            owner_recorded_loss,
+        )
         for row in rows:
             lock = row["claim_lock"] or ""
             if not lock.startswith(host_prefix):
@@ -1195,6 +1200,14 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             exit_code = managed_run_exit_code(conn, row["id"], pid, row["claim_lock"])
             dead = _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board)
             apply_attempt_note(conn, row["id"], pid, dead)
+            if owner_recorded_loss(dead.event_payload):
+                # The OWNER recorded this attempt's loss: the HOST took the
+                # attempt down, so the card's failure budget must not pay for
+                # it. The marker rides on the run metadata (so
+                # ``check_respawn_guard`` spaces the retry) and on the crash
+                # event (so the board still shouts systemic) — never on the
+                # card's death.
+                dead.event_payload["infrastructure"] = True
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
@@ -1239,6 +1252,31 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
     return sweep
+
+
+def _mark_crash_event_sticky(conn: sqlite3.Connection, task_id: str) -> None:
+    """Put a systemic wave's marker on the crash EVENT, not on the card's death.
+
+    A host-level loss does not kill the card, so the marker the ``gave_up``
+    event used to carry has to live on the event that records the crash —
+    otherwise the board loses the "systemic" shout of a wave that took several
+    cards at once.
+    """
+    row = conn.execute(
+        "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = 'crashed' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return
+    payload = _kb._json_dict(row["payload"])
+    if payload.get("sticky"):
+        return
+    payload["sticky"] = True
+    conn.execute(
+        "UPDATE task_events SET payload = ? WHERE id = ?",
+        (_kb._json_or_null(payload), row["id"]),
+    )
 
 
 def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]:
@@ -1307,6 +1345,11 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
             if is_systemic:
                 # Trips at 1, below any ``failure_limit``: hold it for an operator.
                 extra["sticky"] = True
+            # A HOST-level loss (the owner recorded it) never got a fair
+            # chance: book it as infrastructure so the card's failure budget is
+            # not spent on the host's failure. A systemic wave keeps its
+            # marker on the crash EVENT; the card's death carries none.
+            host_level = bool(dead.event_payload.get("infrastructure"))
             tripped = _record_task_failure(
                 conn, tid,
                 error=error_text,
@@ -1315,7 +1358,10 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 release_claim=False,
                 end_run=False,
                 event_payload_extra=extra,
+                infrastructure=host_level,
             )
+            if host_level and is_systemic:
+                _mark_crash_event_sticky(conn, tid)
         if tripped:
             auto_blocked.append(tid)
     return auto_blocked
@@ -1562,7 +1608,8 @@ def check_respawn_guard(
 
     Called per ready/review row before any claim attempt. Priority order:
     ``"infrastructure_cooldown"`` (latest run is a ``spawn_failed`` the host
-    refused — no restart-safe scope — within the cooldown; never counted),
+    refused — no restart-safe scope — or a host-level ``crashed`` run within
+    the cooldown; never counted),
     ``"rate_limit_cooldown"`` (latest run ``rate_limited`` within the cooldown;
     checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
     ``last_failure_error`` that would otherwise park the task forever — that
@@ -1597,7 +1644,8 @@ def check_respawn_guard(
         "ORDER BY ended_at DESC, id DESC LIMIT 1",  # runs end on whole seconds: the later insert wins a tie
         (task_id,),
     ).fetchone()
-    infrastructure = (latest_run is not None and latest_run["outcome"] == "spawn_failed"
+    infrastructure = (latest_run is not None
+                      and latest_run["outcome"] in ("spawn_failed", "crashed")
                       and bool(_kb._json_dict(latest_run["metadata"]).get("infrastructure")))
     ended_at = _kb._to_epoch(latest_run["ended_at"]) if infrastructure else None
     if rl_cooldown > 0 and ended_at is not None and (now - ended_at) < rl_cooldown:

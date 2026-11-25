@@ -245,6 +245,27 @@ def apply_attempt_note(conn, task_id, pid, dead) -> None:
     dead.error_text = f"{head} [{note}]{sep}{output}"
 
 
+def owner_recorded_loss(metadata) -> bool:
+    """True when this attempt's metadata records an OWNER-recorded loss.
+
+    A managed worker the owner recorded as lost (``worker_lost``), or an owner
+    admission it settled as ``interrupted``, is the HOST's failure and not the
+    card's: the attempt never got a fair chance, so it must not spend the
+    card's failure budget. A worker that died with no owner record keeps
+    today's budget exactly.
+
+    The owner writes both markers into the crashed run's metadata (see
+    :func:`apply_attempt_note`), so this reads the same payload the run and
+    the crash event carry.
+    """
+    if not isinstance(metadata, dict):
+        return False
+    if metadata.get("worker_lost"):
+        return True
+    note = str(metadata.get("attempt_note") or "")
+    return note.startswith("owner admission settled interrupted")
+
+
 def owner_reclaim_blocked(conn, task_id, *, crash_sweep=False) -> bool:
     """True when a reclaim path must leave this task alone.
 
