@@ -8,8 +8,10 @@ lost attempt:
   A1  a killed worker under a live claim is booked ``crashed`` within one tick;
   A2  an elapsed ``claim_expires`` never leaves the card ``running`` after one tick, even
       with no heartbeat and no pid (and even behind a settled owner receipt);
-  A3  every such booking increments ``consecutive_failures``, so ``kanban.failure_limit``
-      covers this outcome class and the card blocks at the limit.
+  A3  a HOST-level loss (the owner recorded it) does NOT spend the card's failure
+      budget — the host killed the attempt, so the card stays retryable; a plain
+      crash still increments ``consecutive_failures`` and still blocks the card at
+      ``kanban.failure_limit``.
 """
 
 from __future__ import annotations
@@ -136,20 +138,19 @@ def test_a_killed_managed_worker_is_disposed_of_within_one_tick(board):
     assert run["outcome"] == "crashed"
     assert "managed worker lost: managed_worker_failed" in run["error"]
     assert json.loads(run["metadata"])["attempt_note"] == "managed worker lost: managed_worker_failed"
-    assert row["consecutive_failures"] == 1               # A3: the breaker sees it
+    assert row["consecutive_failures"] == 0               # A3: the HOST's loss, not the card's
     assert row["last_failure_error"]
 
 
-def test_a_killed_managed_worker_blocks_the_card_at_the_failure_limit(board):
-    """The breaker covers this class: one loss short of the limit, the next loss blocks.
+def test_a_plain_crash_blocks_the_card_at_the_failure_limit(board):
+    """A worker that died on its own still spends the budget: the next loss blocks.
 
     ``_account_crashes`` books a plain crash against ``DEFAULT_FAILURE_LIMIT`` (the sweep
     resolves the threshold there rather than against the dispatcher's ``failure_limit``),
     so the card is seeded one failure short of that limit instead of pinning a threshold
     this path never reads.
     """
-    board.running("t_killed", claim_expires_in=900, heartbeat_age=30,
-                  worker_lost="managed_worker_failed")
+    board.running("t_killed", claim_expires_in=900, heartbeat_age=30, owner=False)
     board.conn.execute("UPDATE tasks SET consecutive_failures = ? WHERE id = 't_killed'",
                        (kbd.DEFAULT_FAILURE_LIMIT - 1,))
     board.conn.commit()
@@ -162,7 +163,7 @@ def test_a_killed_managed_worker_blocks_the_card_at_the_failure_limit(board):
     assert "gave_up" in kinds
 
 
-def test_a_lost_worker_that_exited_cleanly_still_charges_the_breaker(board):
+def test_a_lost_worker_that_exited_cleanly_is_booked_as_one_crash(board):
     """rc=0 after a lost managed execution is not a protocol violation: the turn never ran."""
     run_id = board.running("t_clean", claim_expires_in=900, heartbeat_age=30,
                            worker_lost="managed_worker_failed")
@@ -180,7 +181,7 @@ def test_a_lost_worker_that_exited_cleanly_still_charges_the_breaker(board):
     assert "I fixed the protocol violation" in run["error"]  # the worker's own output is kept
     assert run["error"].index("[managed worker lost") < run["error"].index("Worker's last output")
     assert "without kanban_complete" not in run["error"]
-    assert board.state("t_clean")["consecutive_failures"] == 1
+    assert board.state("t_clean")["consecutive_failures"] == 0   # the HOST's loss
     # Not a protocol violation as well: one loss is charged to one budget.
     assert "protocol_violation" not in json.loads(run["metadata"] or "{}")
     kinds = [r[0] for r in board.conn.execute(
@@ -288,7 +289,7 @@ async def test_the_owner_records_the_loss_on_the_board_and_one_tick_disposes_of_
     run = board.run(run_id)
     assert run["outcome"] == "crashed"
     assert "managed worker lost: managed_worker_failed" in run["error"]
-    assert board.state("t_owner")["consecutive_failures"] == 1
+    assert board.state("t_owner")["consecutive_failures"] == 0   # the HOST's loss
 
 
 def test_a_loss_recorded_against_a_superseded_run_is_dropped(board):
@@ -306,3 +307,43 @@ def test_a_loss_recorded_against_a_superseded_run_is_dropped(board):
     board.conn.commit()
     record_worker_loss(policy, "managed_worker_failed", pid=1234, bound=False)
     assert count() == 1
+
+
+# --- B: a HOST-level loss must not spend the card's failure budget --------------------
+
+def test_a_host_level_worker_loss_leaves_the_failure_budget_untouched(board):
+    """The owner recorded the loss: the HOST took the attempt down.
+
+    The attempt never got a fair chance, so the card's failure budget must not
+    pay for it: ``consecutive_failures`` stays where it was, the card stays
+    retryable, and no ``gave_up`` kills it. The run and the event ARE recorded.
+    """
+    run_id = board.running("t_host", claim_expires_in=900, heartbeat_age=30,
+                           worker_lost="managed_worker_failed")
+    board.tick(failure_limit=2)
+    row, run = board.state("t_host"), board.run(run_id)
+    assert row["consecutive_failures"] == 0
+    assert row["status"] == "ready"
+    assert run["outcome"] == "crashed"
+    assert "managed worker lost: managed_worker_failed" in run["error"]
+    kinds = [r[0] for r in board.conn.execute(
+        "SELECT kind FROM task_events WHERE task_id='t_host' ORDER BY id")]
+    assert "crashed" in kinds and "gave_up" not in kinds
+
+
+def test_a_plain_crash_still_spends_the_failure_budget(board):
+    """No owner record: the worker died on its own, so today's budget applies."""
+    run_id = board.running("t_plain", claim_expires_in=900, heartbeat_age=30, owner=False)
+    board.tick(failure_limit=2)
+    row, run = board.state("t_plain"), board.run(run_id)
+    assert row["consecutive_failures"] == 1
+    assert run["outcome"] == "crashed"
+
+
+def test_a_host_level_loss_is_spaced_by_the_infrastructure_cooldown(board, monkeypatch):
+    """The retry is spaced instead of hammering every 60 seconds."""
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    board.running("t_host", claim_expires_in=900, heartbeat_age=30,
+                  worker_lost="managed_worker_failed")
+    board.tick(failure_limit=2)
+    assert kbd.check_respawn_guard(board.conn, "t_host") == "infrastructure_cooldown"
